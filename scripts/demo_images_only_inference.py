@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -18,14 +19,34 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import numpy as np
 import rerun as rr
 import torch
+from PIL import Image
 
 from mapanything.models import MapAnything
 from mapanything.utils.geometry import depthmap_to_world_frame
-from mapanything.utils.image import load_images
+from mapanything.utils.hf_utils.hf_helpers import initialize_mapanything_local
+from mapanything.utils.image import load_images, preprocess_inputs
 from mapanything.utils.viz import (
     predictions_to_glb,
     script_add_rerun_args,
 )
+
+
+# Optional: hard-code a single shared camera intrinsics matrix for ALL images.
+#
+# If you set this to a 3x3 numpy array, the script will switch from `load_images(...)`
+# to `preprocess_inputs(...)` so that intrinsics are correctly updated when images
+# are resized/cropped to the model's working resolution.
+#
+# IMPORTANT: K_OVERRIDE must correspond to the ORIGINAL input image pixel coordinates
+# (before any resizing/cropping).
+K_OVERRIDE: np.ndarray | None = None
+# Example:
+# K_OVERRIDE = np.array(
+#     [[fx, 0.0, cx],
+#      [0.0, fy, cy],
+#      [0.0, 0.0, 1.0]],
+#     dtype=np.float32,
+# )
 
 
 def log_data_to_rerun(
@@ -95,10 +116,87 @@ def get_parser():
         default=False,
         help="Use memory efficient inference for reconstruction (trades off speed)",
     )
+
+    parser.add_argument(
+        "--max_views",
+        type=int,
+        default=None,
+        help="Optionally limit the number of images/views loaded from the folder (useful to reduce VRAM).",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Load every nth image from the folder (stride=2 loads every 2nd image).",
+    )
+
+    parser.add_argument(
+        "--no_amp",
+        action="store_true",
+        default=False,
+        help="Disable automatic mixed precision (uses more VRAM; mainly for debugging).",
+    )
+    parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16", "fp32"],
+        help="Mixed precision dtype. bf16 is default; on older GPUs fp16 may be used/faster and sometimes uses less VRAM.",
+    )
     parser.add_argument(
         "--apache",
         action="store_true",
         help="Use Apache 2.0 licensed model (facebook/map-anything-apache)",
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=(
+            "HuggingFace repo id or local model directory to load via MapAnything.from_pretrained. "
+            "If omitted, defaults to 'facebook/map-anything' (or '-apache' variant)."
+        ),
+    )
+
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help=(
+            "Local checkpoint path (.safetensors/.pt). If set, loads the model fully offline via initialize_mapanything_local "
+            "instead of HuggingFace."
+        ),
+    )
+    parser.add_argument(
+        "--hydra_config_path",
+        type=str,
+        default="configs/train.yaml",
+        help="Hydra config used to build the model when using --checkpoint_path.",
+    )
+    parser.add_argument(
+        "--config_json_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a JSON file that contains 'model_str' and/or 'model_config'. "
+            "If you downloaded a HuggingFace snapshot, this is typically 'config.json'."
+        ),
+    )
+    parser.add_argument(
+        "--config_override",
+        action="append",
+        default=[],
+        help=(
+            "Hydra override string used with --hydra_config_path. Can be passed multiple times. "
+            "If omitted, a safe default set for images-only inference is used."
+        ),
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="Use strict=True for load_state_dict when loading --checkpoint_path.",
     )
     parser.add_argument(
         "--viz",
@@ -134,24 +232,95 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Initialize model from HuggingFace
-    if args.apache:
-        model_name = "facebook/map-anything-apache"
-        print("Loading Apache 2.0 licensed MapAnything model...")
+    # Initialize model
+    if args.checkpoint_path:
+        if args.model is not None:
+            raise ValueError("Use either --checkpoint_path or --model, not both.")
+
+        default_overrides = [
+            "machine=aws",
+            "model=mapanything",
+            "model/task=images_only",
+            "model.encoder.uses_torch_hub=false",
+        ]
+        local_overrides = args.config_override if len(args.config_override) > 0 else default_overrides
+
+        local_config = {
+            "path": args.hydra_config_path,
+            "checkpoint_path": args.checkpoint_path,
+            "config_overrides": local_overrides,
+            "config_json_path": args.config_json_path,
+            "strict": args.strict,
+        }
+
+        print(f"Loading local MapAnything checkpoint: {args.checkpoint_path}")
+        print(f"Hydra config: {args.hydra_config_path}")
+        if args.config_json_path:
+            print(f"Config JSON: {args.config_json_path}")
+        print(f"Hydra overrides: {json.dumps(local_overrides)}")
+        model = initialize_mapanything_local(local_config, device)
     else:
-        model_name = "facebook/map-anything"
-        print("Loading CC-BY-NC 4.0 licensed MapAnything model...")
-    model = MapAnything.from_pretrained(model_name).to(device)
+        if args.model is not None:
+            model_name_or_path = args.model
+            print(f"Loading MapAnything model from: {model_name_or_path}")
+        else:
+            if args.apache:
+                model_name_or_path = "facebook/map-anything-apache"
+                print("Loading Apache 2.0 licensed MapAnything model...")
+            else:
+                model_name_or_path = "facebook/map-anything"
+                print("Loading CC-BY-NC 4.0 licensed MapAnything model...")
+
+        model = MapAnything.from_pretrained(model_name_or_path).to(device)
 
     # Load images
     print(f"Loading images from: {args.image_folder}")
-    views = load_images(args.image_folder)
+
+    stride = max(int(args.stride), 1)
+    if K_OVERRIDE is None:
+        views = load_images(args.image_folder, stride=stride)
+        if args.max_views is not None:
+            views = views[: max(int(args.max_views), 1)]
+    else:
+        if not isinstance(K_OVERRIDE, np.ndarray) or K_OVERRIDE.shape != (3, 3):
+            raise ValueError(
+                f"K_OVERRIDE must be a numpy array of shape (3, 3), got {type(K_OVERRIDE)} with shape {getattr(K_OVERRIDE, 'shape', None)}"
+            )
+
+        # Build raw views with explicit intrinsics (one K shared across all images)
+        supported_exts = (".jpg", ".jpeg", ".png")
+        image_paths = sorted(
+            [
+                os.path.join(args.image_folder, f)
+                for f in os.listdir(args.image_folder)
+                if f.lower().endswith(supported_exts)
+            ]
+        )
+        image_paths = image_paths[::stride]
+        if args.max_views is not None:
+            image_paths = image_paths[: max(int(args.max_views), 1)]
+
+        if len(image_paths) == 0:
+            raise ValueError(f"No images found in {args.image_folder} with extensions {supported_exts}")
+
+        raw_views = []
+        for p in image_paths:
+            img = np.array(Image.open(p).convert("RGB"), dtype=np.uint8)
+            raw_views.append({"img": img, "intrinsics": K_OVERRIDE.astype(np.float32)})
+
+        # preprocess_inputs will resize/crop images to the model resolution and
+        # will update intrinsics accordingly.
+        views = preprocess_inputs(raw_views, norm_type="dinov2", resize_mode="fixed_mapping")
+
     print(f"Loaded {len(views)} views")
 
     # Run model inference
     print("Running inference...")
     outputs = model.infer(
-        views, memory_efficient_inference=args.memory_efficient_inference
+        views,
+        memory_efficient_inference=args.memory_efficient_inference,
+        use_amp=not args.no_amp,
+        amp_dtype=args.amp_dtype,
     )
     print("Inference complete!")
 
