@@ -29,6 +29,7 @@ from mapanything.utils.viz import (
     predictions_to_glb,
     script_add_rerun_args,
 )
+import trimesh
 
 
 # Optional: hard-code a single shared camera intrinsics matrix for ALL images.
@@ -41,12 +42,14 @@ from mapanything.utils.viz import (
 # (before any resizing/cropping).
 K_OVERRIDE: np.ndarray | None = None
 # Example:
-# K_OVERRIDE = np.array(
-#     [[fx, 0.0, cx],
-#      [0.0, fy, cy],
-#      [0.0, 0.0, 1.0]],
-#     dtype=np.float32,
-# )
+K_OVERRIDE = np.array(
+    [
+        [907.359497070312, 0.0, 632.73291015625],
+        [0.0, 907.26708984375, 353.749420166016],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float32,
+)
 
 
 def log_data_to_rerun(
@@ -216,6 +219,18 @@ def get_parser():
         default="output.glb",
         help="Output path for GLB file (default: output.glb)",
     )
+    parser.add_argument(
+        "--save_ply",
+        action="store_true",
+        default=False,
+        help="Save reconstruction as PLY point cloud",
+    )
+    parser.add_argument(
+        "--output_ply",
+        type=str,
+        default="output.ply",
+        help="Output path for PLY file (default: output.ply)",
+    )
 
     return parser
 
@@ -355,8 +370,8 @@ def main():
         pts3d_np = pts3d_computed.cpu().numpy()
         image_np = pred["img_no_norm"][0].cpu().numpy()
 
-        # Store data for GLB export if needed
-        if args.save_glb:
+        # Store data for GLB/PLY export if needed
+        if args.save_glb or args.save_ply:
             world_points_list.append(pts3d_np)
             images_list.append(image_np)
             masks_list.append(mask)
@@ -402,6 +417,37 @@ def main():
         print(f"Successfully saved GLB file: {args.output_path}")
     else:
         print("Skipping GLB export (--save_glb not specified)")
+
+    # Export PLY if requested
+    if args.save_ply:
+        # Ensure we have stacked arrays (may not have run GLB branch)
+        if not args.save_glb:
+            if len(world_points_list) == 0:
+                print("No view data collected for PLY export; skipping")
+            else:
+                world_points = np.stack(world_points_list, axis=0)
+                images = np.stack(images_list, axis=0)
+                final_masks = np.stack(masks_list, axis=0)
+
+        print(f"Saving PLY file to: {args.output_ply}")
+
+        pts_all = []
+        cols_all = []
+        for wp, img, m in zip(world_points, images, final_masks):
+            pts_all.append(wp[m].reshape(-1, 3))
+            # img assumed in [0,1]
+            cols_all.append((img[m].reshape(-1, 3) * 255.0).clip(0, 255).astype(np.uint8))
+
+        pts_all_np = np.concatenate(pts_all, axis=0) if len(pts_all) else np.zeros((0, 3), dtype=np.float32)
+        cols_all_np = np.concatenate(cols_all, axis=0) if len(cols_all) else np.zeros((0, 3), dtype=np.uint8)
+
+        out_ply = args.output_ply
+        out_dir = os.path.dirname(out_ply)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        trimesh.PointCloud(pts_all_np, colors=cols_all_np).export(out_ply)
+        print(f"Successfully saved PLY file: {out_ply}")
 
 
 if __name__ == "__main__":

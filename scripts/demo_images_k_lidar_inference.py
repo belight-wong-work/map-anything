@@ -72,21 +72,27 @@ from mapanything.utils.lidar_projection import (
 # Shared camera intrinsics for ALL frames, in ORIGINAL input image pixel coords.
 K_OVERRIDE: np.ndarray | None = None
 # Example:
-# K_OVERRIDE = np.array(
-#     [[fx, 0.0, cx],
-#      [0.0, fy, cy],
-#      [0.0, 0.0, 1.0]],
-#     dtype=np.float32,
-# )
+K_OVERRIDE = np.array(
+    [
+        [907.359497070312, 0.0, 632.73291015625],
+        [0.0, 907.26708984375, 353.749420166016],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float32,
+)
 
 # Fixed LiDAR->Camera transform (T_cam_lidar), 4x4.
 T_CAM_LIDAR_OVERRIDE: np.ndarray | None = None
 # Example:
-# T_CAM_LIDAR_OVERRIDE = np.array(
-#     [[...], [...], [...], [0, 0, 0, 1]],
-#     dtype=np.float32,
-# )
-
+T_CAM_LIDAR_OVERRIDE = np.array(
+    [
+        [1.0, 0.0, 0.0, 0.012],
+        [0.0, 1.0, 0.0, 0.03],
+        [0.0, 0.0, 1.0, -0.003],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float32,
+)
 
 def _load_matrix_4x4(path: str) -> np.ndarray:
     p = Path(path)
@@ -329,7 +335,7 @@ def main() -> None:
                 "intrinsics": K,
                 "depth_z": depth_z,
                 # LiDAR is metric.
-                "is_metric_scale": True,
+                "is_metric_scale": torch.tensor([True]),
             }
         )
 
